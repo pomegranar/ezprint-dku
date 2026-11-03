@@ -10,7 +10,7 @@ rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos26.0 \
     Sources/*.swift -o "$APP/Contents/MacOS/DKU ezPrint"
 cp Info.plist "$APP/Contents/"
-cp -R Resources/ppd "$APP/Contents/Resources/"
+cp -R Resources/ppd Resources/AppIcon.icns "$APP/Contents/Resources/"
 codesign --force --deep --sign - "$APP"
 echo "built $APP"
 
