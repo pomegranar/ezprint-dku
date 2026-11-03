@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="190" viewBox="0 0 640 190">
+  <title>DKU ezPrint</title>
+  <rect width="640" height="190" fill="#ffffff"/>
+  <text x="32" y="122" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="104" letter-spacing="-2" xml:space="preserve"><tspan font-weight="800" fill="#012169">DKU</tspan><tspan font-weight="500" fill="#012169" dx="14">ez</tspan><tspan font-weight="800" fill="#00843D" dx="12">Print</tspan></text>
+  <rect x="32" y="146" width="570" height="6" rx="3" fill="#00843D"/>
+</svg>
