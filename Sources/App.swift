@@ -60,7 +60,13 @@ struct PDFPreview: NSViewRepresentable {
         return v
     }
     func updateNSView(_ v: PDFView, context: Context) {
-        if v.document !== document { v.document = document }
+        guard v.document !== document else { return }
+        // Stay on the same sheet when the layout is re-rendered.
+        let index = v.currentPage.flatMap { v.document?.index(for: $0) } ?? 0
+        v.document = document
+        if let document, index > 0, let page = document.page(at: min(index, document.pageCount - 1)) {
+            v.go(to: page)
+        }
     }
 }
 
@@ -75,9 +81,13 @@ struct ContentView: View {
     @AppStorage("copies") private var copies = 1
     @AppStorage("allPages") private var allPages = true
     @AppStorage("pageRange") private var pageRange = ""
+    @AppStorage("perSide") private var perSide = 1
+    @AppStorage("booklet") private var booklet = false
 
     @State private var title = ""
     @State private var dropTargeted = false
+    @State private var laidOut: PDFDocument?
+    @State private var rendering = false
 
     private var selectedQueue: Queue { Queue(rawValue: queue) ?? .ricohBW }
     private var selectedSides: Sides { Sides(rawValue: sides) ?? .long }
@@ -89,28 +99,36 @@ struct ContentView: View {
         return allPages ? Array(1...pageCount) : parsePageRange(pageRange, pageCount: pageCount)
     }
 
-    private var preview: PDFDocument? {
-        guard let doc = model.document, let pages else { return model.document }
-        if allPages { return doc }
-        let out = PDFDocument()
-        for (i, n) in pages.enumerated() {
-            if let page = doc.page(at: n - 1)?.copy() as? PDFPage { out.insert(page, at: i) }
-        }
-        return out
+    /// The job as set up in the sidebar, or nil when there is nothing to print.
+    private var job: PrintJob? {
+        guard let url = model.url, let pages, !pages.isEmpty else { return nil }
+        return PrintJob(file: url,
+                        title: title.isEmpty ? url.deletingPathExtension().lastPathComponent : title,
+                        netid: netid.trimmingCharacters(in: .whitespaces),
+                        queue: selectedQueue, copies: copies, sides: selectedSides, paper: paper,
+                        pages: pages, perSide: perSide, booklet: booklet)
+    }
+
+    /// One copy of the job, minus the fields that don't change what prints, so typing
+    /// a NetID or job name doesn't re-render the preview.
+    private var previewJob: PrintJob? {
+        guard var j = job else { return nil }
+        j.title = ""; j.netid = ""; j.copies = 1; j.sides = .one
+        return j
     }
 
     /// Pricing from it.dukekunshan.edu.cn/eprint-information: RMB 3.00 per colour
     /// side, RMB 0.30 per black & white side, and double-sided costs half.
     private let pricingPage = URL(string: "https://it.dukekunshan.edu.cn/eprint-information/")!
 
-    private func cost(_ sidesPrinted: Int) -> Decimal {
-        let rate: Decimal = selectedQueue.isColor ? 3.00 : 0.30
-        let factor: Decimal = selectedSides.isDuplex ? 0.5 : 1
-        return Decimal(sidesPrinted * copies) * rate * factor
+    private func cost(_ job: PrintJob, sidesPerCopy: Int) -> Decimal {
+        let rate: Decimal = job.queue.isColor ? 3.00 : 0.30
+        let factor: Decimal = job.effectiveSides.isDuplex ? 0.5 : 1
+        return Decimal(sidesPerCopy * job.copies) * rate * factor
     }
 
     private var canPrint: Bool {
-        model.document != nil && !model.isPrinting && Engine.validNetID(netid) && (pages?.isEmpty == false)
+        job != nil && !model.isPrinting && Engine.validNetID(netid)
     }
 
     var body: some View {
@@ -124,11 +142,26 @@ struct ContentView: View {
                     } actions: {
                         Button("Open…") { model.showImporter = true }
                     }
+                } else if let laidOut {
+                    PDFPreview(document: laidOut)
+                        .overlay(alignment: .topTrailing) {
+                            if rendering { ProgressView().controlSize(.small).padding(10) }
+                        }
                 } else {
-                    PDFPreview(document: preview)
+                    ProgressView()
                 }
             }
             .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+            .task(id: previewJob) {
+                guard let job = previewJob else { laidOut = nil; return }
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+                rendering = true
+                let data = await Task.detached(priority: .userInitiated) { try? Engine.render(job) }.value
+                guard !Task.isCancelled else { return }
+                rendering = false
+                laidOut = data.flatMap { PDFDocument(data: $0) }
+            }
 
             Divider()
 
@@ -148,7 +181,10 @@ struct ContentView: View {
         .fileImporter(isPresented: $model.showImporter, allowedContentTypes: [.pdf]) { result in
             if case .success(let u) = result { model.open(u) }
         }
-        .onChange(of: model.url) { _, new in title = new?.deletingPathExtension().lastPathComponent ?? "" }
+        .onChange(of: model.url) { _, new in
+            title = new?.deletingPathExtension().lastPathComponent ?? ""
+            laidOut = nil
+        }
         .alert(item: $model.failure) { f in
             Alert(title: Text(f.title), message: Text(f.message), dismissButton: .default(Text("OK")))
         }
@@ -201,8 +237,12 @@ struct ContentView: View {
                 Picker("Paper Size", selection: $paper) {
                     ForEach(paperSizes, id: \.self) { Text($0).tag($0) }
                 }
-                Picker("Sides", selection: $sides) {
-                    ForEach(Sides.allCases) { Text($0.label).tag($0.rawValue) }
+                if booklet && perSide == 2 {
+                    LabeledContent("Sides", value: Sides.short.label)
+                } else {
+                    Picker("Sides", selection: $sides) {
+                        ForEach(Sides.allCases) { Text($0.label).tag($0.rawValue) }
+                    }
                 }
                 Stepper("Copies: \(copies)", value: $copies, in: 1...99)
             }
@@ -218,6 +258,17 @@ struct ContentView: View {
                             .font(.caption).foregroundStyle(.red)
                     }
                 }
+                Picker("Pages per Side", selection: $perSide) {
+                    ForEach([1, 2, 4], id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.segmented)
+                if perSide == 2 {
+                    Toggle("Booklet", isOn: $booklet)
+                    if booklet {
+                        Text("Prints two-sided. Fold the stack in half to read it as a booklet.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }
             Section("Job") {
                 TextField("Name", text: $title, prompt: Text("Shown at the station"))
@@ -228,17 +279,18 @@ struct ContentView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if model.document != nil, let pages {
-                let sheets = selectedSides.isDuplex ? (pages.count + 1) / 2 : pages.count
-                Text("\(pages.count) \(pages.count == 1 ? "page" : "pages") · \(sheets * copies) \(sheets * copies == 1 ? "sheet" : "sheets") · \(paper) · \(selectedQueue.isColor ? "Colour" : "Black & White")")
+            if let job {
+                let sides = Engine.impose(job).count
+                let sheets = (job.effectiveSides.isDuplex ? (sides + 1) / 2 : sides) * copies
+                Text("\(job.pages.count) \(job.pages.count == 1 ? "page" : "pages") · \(sheets) \(sheets == 1 ? "sheet" : "sheets") · \(paper) · \(selectedQueue.isColor ? "Colour" : "Black & White")")
                     .font(.caption).foregroundStyle(.secondary)
             }
             HStack {
                 if model.isPrinting {
                     ProgressView().controlSize(.small)
                     Text(model.status).font(.caption).foregroundStyle(.secondary)
-                } else if model.document != nil, let pages {
-                    Text(cost(pages.count).formatted(.currency(code: "CNY")))
+                } else if let job {
+                    Text(cost(job, sidesPerCopy: Engine.impose(job).count).formatted(.currency(code: "CNY")))
                         .monospacedDigit()
                     Button {
                         NSWorkspace.shared.open(pricingPage)
@@ -258,13 +310,7 @@ struct ContentView: View {
     }
 
     private func startPrint() {
-        guard let url = model.url, let pages else { return }
-        let job = PrintJob(
-            file: url,
-            title: title.isEmpty ? url.deletingPathExtension().lastPathComponent : title,
-            netid: netid.trimmingCharacters(in: .whitespaces),
-            queue: selectedQueue, copies: copies, sides: selectedSides, paper: paper,
-            pages: pages)
+        guard let job else { return }
         model.isPrinting = true
         Task.detached {
             do {

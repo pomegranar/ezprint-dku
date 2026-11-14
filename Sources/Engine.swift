@@ -50,7 +50,7 @@ struct PrintFailure: Error, Identifiable {
     let message: String
 }
 
-struct PrintJob {
+struct PrintJob: Equatable, Sendable {
     var file: URL
     var title: String
     var netid: String
@@ -59,6 +59,12 @@ struct PrintJob {
     var sides: Sides
     var paper: String
     var pages: [Int]         // 1-based, in print order
+    var perSide = 1          // 1, 2 or 4
+    var booklet = false      // only with 2 per side
+
+    var isBooklet: Bool { booklet && perSide == 2 }
+    /// Booklets must flip on the short edge: the two-up sides are landscape on portrait paper.
+    var effectiveSides: Sides { isBooklet ? .short : sides }
 }
 
 enum Engine {
@@ -92,19 +98,62 @@ enum Engine {
         return (CGSize(width: d[0], height: d[1]), printable)
     }
 
-    /// Lay the chosen pages onto the paper like Preview's "Scale to Fit": each page is
-    /// centred, scaled up or down to the printable area, and turned if its orientation
-    /// differs from the paper's. Black & white queues are converted to grayscale here,
-    /// since the print server releases them to colour devices that would otherwise
-    /// print the colour data as-is.
-    static func layout(_ job: PrintJob, ppd: URL, into out: URL) throws {
+    /// The document pages on each printed side of one copy, in print order; nil is a blank cell.
+    /// A booklet pads to a multiple of four and orders pages so the stack folds in half:
+    /// sheet i carries [last - 2i, first + 2i] on the front and [first + 2i + 1, last - 2i - 1] on the back.
+    static func impose(_ job: PrintJob) -> [[Int?]] {
+        if job.isBooklet {
+            var p: [Int?] = job.pages
+            while p.count % 4 != 0 { p.append(nil) }
+            let n = p.count
+            var sides: [[Int?]] = []
+            for i in 0..<n / 4 {
+                let front: [Int?] = [p[n - 1 - 2 * i], p[2 * i]]
+                let back: [Int?] = [p[2 * i + 1], p[n - 2 - 2 * i]]
+                sides += [front, back]
+            }
+            return sides
+        }
+        return stride(from: 0, to: job.pages.count, by: job.perSide).map { i in
+            (i..<i + job.perSide).map { $0 < job.pages.count ? job.pages[$0] : nil }
+        }
+    }
+
+    /// Where each cell of a side goes on the paper, in reading order. Two-up cells are read
+    /// with the sheet turned to landscape (its top at the paper's left), so they are rotated
+    /// and the reading-left cell sits at the bottom.
+    static func cells(_ perSide: Int, in area: CGRect) -> [(rect: CGRect, turned: Bool)] {
+        let gap: CGFloat = 8
+        switch perSide {
+        case 2:
+            let h = (area.height - gap) / 2
+            return [(CGRect(x: area.minX, y: area.minY, width: area.width, height: h), true),
+                    (CGRect(x: area.minX, y: area.maxY - h, width: area.width, height: h), true)]
+        case 4:
+            let w = (area.width - gap) / 2, h = (area.height - gap) / 2
+            let left = area.minX, right = area.maxX - w, top = area.maxY - h, bottom = area.minY
+            return [(left, top), (right, top), (left, bottom), (right, bottom)].map {
+                (CGRect(x: $0.0, y: $0.1, width: w, height: h), false)
+            }
+        default:
+            return [(area, false)]
+        }
+    }
+
+    /// Lay the chosen pages onto the paper: each page is centred and scaled up or down to fill
+    /// its cell (the printable area, or a half or quarter of it), and turned if its orientation
+    /// differs from the cell's. Copies are laid out collated here, each starting on a fresh sheet
+    /// when printing two-sided. Black & white queues are converted to grayscale here, since the
+    /// print server releases them to colour devices that would otherwise print colour as-is.
+    static func layout(_ job: PrintJob, into consumer: CGDataConsumer) throws {
         let prepFailed = { (why: String) in PrintFailure(title: "Couldn't Prepare the Document", message: why) }
+        let ppd = try ppd(for: job.queue)
         guard let doc = PDFDocument(url: job.file) else { throw prepFailed("The PDF could not be read.") }
         guard let paper = paper(job.paper, ppd: ppd) else {
             throw prepFailed("\(job.paper) paper is not supported by \(job.queue.label).")
         }
         var media = CGRect(origin: .zero, size: paper.size)
-        guard let ctx = CGContext(out as CFURL, mediaBox: &media, nil) else { throw prepFailed("Could not create a temporary file.") }
+        guard let ctx = CGContext(consumer: consumer, mediaBox: &media, nil) else { throw prepFailed("Could not create a temporary file.") }
 
         var gray: QuartzFilter?
         if !job.queue.isColor {
@@ -116,41 +165,65 @@ enum Engine {
             gray = f
         }
 
-        let area = paper.printable
-        for n in job.pages {
-            guard let page = doc.page(at: n - 1) else { continue }
-            let box = page.bounds(for: .cropBox)
-            var w = box.width, h = box.height
-            if page.rotation % 180 != 0 { swap(&w, &h) }
-            let turn = (w > h) != (area.width > area.height)
-            let scale = turn ? min(area.width / h, area.height / w) : min(area.width / w, area.height / h)
+        var sides = impose(job)
+        if job.effectiveSides.isDuplex && sides.count % 2 == 1 { sides.append([]) }
+        let all = (0..<job.copies).flatMap { _ in sides }.dropLast(sides.last?.isEmpty == true ? 1 : 0)
+        let cells = cells(job.perSide, in: paper.printable)
 
+        for side in all {
             ctx.beginPDFPage(nil)
-            ctx.saveGState()
-            ctx.translateBy(x: area.midX, y: area.midY)
-            if turn { ctx.rotate(by: .pi / 2) }
-            ctx.scaleBy(x: scale, y: scale)
-            ctx.translateBy(x: -w / 2, y: -h / 2)
-            page.draw(with: .cropBox, to: ctx)
-            ctx.restoreGState()
+            for (cell, n) in zip(cells, side) {
+                guard let n, let page = doc.page(at: n - 1) else { continue }
+                let box = page.bounds(for: .cropBox)
+                var w = box.width, h = box.height
+                if page.rotation % 180 != 0 { swap(&w, &h) }
+                var cw = cell.rect.width, ch = cell.rect.height
+
+                ctx.saveGState()
+                ctx.translateBy(x: cell.rect.midX, y: cell.rect.midY)
+                if cell.turned { ctx.rotate(by: .pi / 2); swap(&cw, &ch) }
+                let turn = (w > h) != (cw > ch)
+                if turn { ctx.rotate(by: .pi / 2) }
+                let scale = turn ? min(cw / h, ch / w) : min(cw / w, ch / h)
+                ctx.scaleBy(x: scale, y: scale)
+                ctx.translateBy(x: -w / 2, y: -h / 2)
+                page.draw(with: .cropBox, to: ctx)
+                ctx.restoreGState()
+            }
             ctx.endPDFPage()
         }
         gray?.remove(from: ctx)
         ctx.closePDF()
     }
 
+    /// The laid-out document as PDF data, for the preview.
+    static func render(_ job: PrintJob) throws -> Data {
+        let data = NSMutableData()
+        try layout(job, into: CGDataConsumer(data: data as CFMutableData)!)
+        return data as Data
+    }
+
+    static func ppd(for queue: Queue) throws -> URL {
+        guard let url = Bundle.main.url(forResource: queue.ppd, withExtension: "ppd", subdirectory: "ppd") else {
+            throw PrintFailure(title: "Printer Driver Missing", message: "The \(queue.rawValue) driver is not bundled with this copy of the app. Reinstall DKU ezPrint.")
+        }
+        return url
+    }
+
     /// Convert the PDF to the printer's PostScript, honouring paper size, layout, colour and duplex.
     static func filter(_ job: PrintJob, into out: URL) throws {
-        guard let ppd = Bundle.main.url(forResource: job.queue.ppd, withExtension: "ppd", subdirectory: "ppd") else {
-            throw PrintFailure(title: "Printer Driver Missing", message: "The \(job.queue.rawValue) driver is not bundled with this copy of the app. Reinstall DKU ezPrint.")
-        }
+        let ppd = try ppd(for: job.queue)
         let laidOut = out.deletingPathExtension().appendingPathExtension("pdf")
         defer { try? FileManager.default.removeItem(at: laidOut) }
-        try layout(job, ppd: ppd, into: laidOut)
+        do {   // scoped so the consumer is released, and the file closed, before cupsfilter reads it
+            guard let consumer = CGDataConsumer(url: laidOut as CFURL) else {
+                throw PrintFailure(title: "Couldn't Prepare the Document", message: "Could not create a temporary file.")
+            }
+            try layout(job, into: consumer)
+        }
 
         var args = ["-m", "application/vnd.cups-postscript", "-p", ppd.path, "-t", job.title]
-        if job.copies > 1 { args += ["-n", String(job.copies)] }
-        for o in ["sides=\(job.sides.rawValue)", "media=\(job.paper)"] { args += ["-o", o] }
+        for o in ["sides=\(job.effectiveSides.rawValue)", "media=\(job.paper)"] { args += ["-o", o] }
         args.append(laidOut.path)
 
         let errURL = out.appendingPathExtension("err")
