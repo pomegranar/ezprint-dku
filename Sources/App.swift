@@ -264,8 +264,7 @@ struct ContentView: View {
             title: title.isEmpty ? url.deletingPathExtension().lastPathComponent : title,
             netid: netid.trimmingCharacters(in: .whitespaces),
             queue: selectedQueue, copies: copies, sides: selectedSides, paper: paper,
-            pageRange: allPages ? nil : pageRange.replacingOccurrences(of: " ", with: ""))
-        _ = pages
+            pages: pages)
         model.isPrinting = true
         Task.detached {
             do {
